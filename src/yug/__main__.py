@@ -13,9 +13,11 @@ agents as a gate before a long download.
 from __future__ import annotations
 
 import argparse
+import os
 import platform
 import shutil
 import sys
+from pathlib import Path
 
 # Weights are fp32; ~271.8M parameters is ~1.0 GB on disk and in memory, and
 # activations plus the rollout KV cache need headroom on top.
@@ -39,9 +41,25 @@ def _host_ram_gb() -> float | None:
 
 
 def os_sysconf_ram() -> float:
-    import os
-
     return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+
+
+def _weights_cache_dir() -> Path:
+    """Where ``from_pretrained`` will cache the weights it downloads."""
+    try:
+        from huggingface_hub import constants
+
+        return Path(constants.HF_HUB_CACHE)
+    except ImportError:
+        hf_home = os.environ.get("HF_HOME") or Path.home() / ".cache" / "huggingface"
+        return Path(hf_home) / "hub"
+
+
+def _nearest_existing(path: Path) -> Path:
+    """``path`` or its closest parent that exists; the cache is absent on a first run."""
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    return path
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -124,13 +142,16 @@ def main(argv: list[str] | None = None) -> int:
                 f"hold the weights"
             )
 
-    free_disk = _gb(shutil.disk_usage(".").free)
+    # The weights are cached under the Hugging Face cache, which can sit on a
+    # different drive from the working directory.
+    cache_dir = _weights_cache_dir()
+    free_disk = _gb(shutil.disk_usage(_nearest_existing(cache_dir)).free)
     report("Free disk", f"{free_disk:.1f} GB")
     report("Weights need", f"~{WEIGHTS_GB:.2f} GB")
     if free_disk < MIN_DISK_GB:
         problems.append(
-            f"{free_disk:.1f} GB free is not enough to cache the weights "
-            f"(need ~{MIN_DISK_GB:.0f} GB with headroom)"
+            f"{free_disk:.1f} GB free is not enough to cache the weights in "
+            f"{cache_dir} (need ~{MIN_DISK_GB:.0f} GB with headroom)"
         )
 
     # --- Verdict -----------------------------------------------------------
