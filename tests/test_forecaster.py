@@ -8,7 +8,6 @@ import numpy as np
 import pytest
 
 from yug import ForecastResult, InferenceConfig, YugForecaster
-from yug.forecaster import _MultivariateInferenceDataset, _UnivariateInferenceDataset
 
 
 @pytest.fixture
@@ -93,26 +92,38 @@ def test_a_zero_patch_series_fails_loudly_instead_of_returning_zeros():
         result.last_window_forecast(0)
 
 
-def test_univariate_inference_masks_infinities(tiny_config):
-    cfg = InferenceConfig.from_model_config(tiny_config, device="cpu")
-    dataset = _UnivariateInferenceDataset(
-        [{"target": np.array([1.0, np.inf, -np.inf, 4.0], dtype=np.float32)}], cfg
-    )
+def test_univariate_inference_forecast_matches_nan_at_infinite_positions(
+    forecaster, series
+):
+    with_inf = series.copy()
+    with_nan = series.copy()
+    with_inf[[10, 15]] = [np.inf, -np.inf]
+    with_nan[[10, 15]] = np.nan
 
-    item = dataset[0]
-    assert item["patches"].ravel()[:4].tolist() == [1.0, 0.0, 0.0, 4.0]
-    assert item["mask"].ravel()[:4].tolist() == [1, 0, 0, 1]
+    forecast_inf = forecaster.predict_batch([{"target": with_inf}]).predictions
+    forecast_nan = forecaster.predict_batch([{"target": with_nan}]).predictions
+
+    assert np.array_equal(forecast_inf, forecast_nan)
 
 
-def test_multivariate_inference_masks_infinities(tiny_config):
-    cfg = InferenceConfig.from_model_config(tiny_config, device="cpu")
-    dataset = _MultivariateInferenceDataset(
-        [{"target": np.array([[1.0, np.inf, -np.inf, 4.0]], dtype=np.float32)}], cfg
-    )
+def test_multivariate_inference_forecast_matches_nan_at_infinite_positions(
+    forecaster, series
+):
+    with_inf = np.stack([series.copy(), np.roll(series, 3)])
+    with_nan = with_inf.copy()
+    with_inf[0, 10] = np.inf
+    with_inf[1, 15] = -np.inf
+    with_nan[0, 10] = np.nan
+    with_nan[1, 15] = np.nan
 
-    item = dataset[0]
-    assert item["patches"].ravel()[:4].tolist() == [1.0, 0.0, 0.0, 4.0]
-    assert item["mask"].ravel()[:4].tolist() == [1, 0, 0, 1]
+    forecast_inf = forecaster.predict_batch(
+        [{"target": with_inf}], mode="multivariate"
+    ).predictions
+    forecast_nan = forecaster.predict_batch(
+        [{"target": with_nan}], mode="multivariate"
+    ).predictions
+
+    assert np.array_equal(forecast_inf, forecast_nan)
 
 
 def test_rejects_a_2d_series(forecaster, series):
