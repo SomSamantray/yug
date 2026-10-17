@@ -57,10 +57,13 @@ batch shapes reproduced bit for bit.
 
 from __future__ import annotations
 
+import threading
+from dataclasses import dataclass
+
 import torch
 import torch.nn.functional as F
 
-__all__ = ["CachedUnivariateEngine"]
+__all__ = ["CachedUnivariateEngine", "RolloutSession"]
 
 
 class _RevInState:
@@ -83,18 +86,34 @@ class _RevInState:
         )
 
 
+@dataclass
+class RolloutSession:
+    """Mutable caches and normalization state for one prediction rollout."""
+
+    pk: list[torch.Tensor]
+    pv: list[torch.Tensor]
+    sk: list[torch.Tensor]
+    sv: list[torch.Tensor]
+    n_prefix: int
+    valid: torch.Tensor
+    all_valid: bool
+    pos: int
+    freq_emb: torch.Tensor
+    revin: _RevInState | None = None
+
+
 class CachedUnivariateEngine:
     """Incremental univariate decoder over a shared, cached context prefix.
 
     Usage::
 
         eng = CachedUnivariateEngine(model)
-        qf = eng.begin(ctx, ctx_mask, freq_ids, scalings,
-                       n_paths=100, max_patches=...)   # (1, Q, output_len)
-        qf = eng.extend(new_patches)                   # (B, Q, output_len)
+        qf, rollout = eng.begin(ctx, ctx_mask, freq_ids, scalings,
+                                n_paths=100, max_patches=...)  # (1, Q, output_len)
+        qf = eng.extend(rollout, new_patches)                 # (B, Q, output_len)
 
-    One engine instance is bound to one context. Call :meth:`begin` again to
-    start a new series; the RoPE table is reused across series.
+    Each :meth:`begin` call creates independent rollout state, so one engine
+    can serve concurrent contexts. The RoPE table is reused across rollouts.
     """
 
     def __init__(self, model) -> None:
@@ -113,20 +132,7 @@ class CachedUnivariateEngine:
         self._cos: torch.Tensor | None = None
         self._sin: torch.Tensor | None = None
         self._rope_len = 0
-
-        # Populated by begin().
-        # Per-layer K/V of the shared context, each (1, H, S0, hd).
-        self._pk: list[torch.Tensor] = []
-        self._pv: list[torch.Tensor] = []
-        # Per-layer K/V each path generated itself, each (B, H, tail_max, hd).
-        self._sk: list[torch.Tensor] = []
-        self._sv: list[torch.Tensor] = []
-        self._n_prefix = 0  # S0: patches in the shared context
-        self._valid: torch.Tensor | None = None  # (S0,) context patches with data
-        self._all_valid = True
-        self._pos = 0
-        self._freq_emb: torch.Tensor | None = None
-        self._state: _RevInState | None = None
+        self._rope_lock = threading.Lock()
 
     # ------------------------------------------------------------------ RoPE
     def _rope(self, total_len: int, dtype: torch.dtype):
@@ -137,18 +143,20 @@ class CachedUnivariateEngine:
         activation dtype. Index ``i``'s value does not depend on ``total_len``,
         so one oversized table serves every chunk.
         """
-        if (
-            self._cos is not None
-            and self._rope_len >= total_len
-            and self._cos.dtype == dtype
-        ):
-            return self._cos, self._sin
-        rope = self.layers[0].self_attn_tar.rope
-        t = torch.arange(total_len, device=self.device, dtype=dtype)
-        freqs = torch.einsum("i,j->ij", t, rope.inv_freq.to(dtype))
-        emb = freqs.repeat_interleave(2, dim=-1)
-        self._cos, self._sin, self._rope_len = emb.cos(), emb.sin(), total_len
-        return self._cos, self._sin
+        with self._rope_lock:
+            if (
+                self._cos is not None
+                and self._rope_len >= total_len
+                and self._cos.dtype == dtype
+            ):
+                return self._cos, self._sin
+            rope = self.layers[0].self_attn_tar.rope
+            t = torch.arange(total_len, device=self.device, dtype=dtype)
+            freqs = torch.einsum("i,j->ij", t, rope.inv_freq.to(dtype))
+            emb = freqs.repeat_interleave(2, dim=-1)
+            cos, sin = emb.cos(), emb.sin()
+            self._cos, self._sin, self._rope_len = cos, sin, total_len
+            return cos, sin
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -208,7 +216,11 @@ class CachedUnivariateEngine:
 
     # --------------------------------------------------------------- encoder
     def _embed(
-        self, patches: torch.Tensor, mask: torch.Tensor, state: _RevInState | None
+        self,
+        patches: torch.Tensor,
+        mask: torch.Tensor,
+        state: _RevInState | None,
+        freq_emb: torch.Tensor,
     ):
         """``(B, S, patch_len)`` -> token embeddings ``(B, S, D)``."""
         validity = mask.to(dtype=patches.dtype)
@@ -218,7 +230,7 @@ class CachedUnivariateEngine:
         validity = validity.to(activation_dtype)
         x = torch.cat([x, validity], dim=-1)
         x = self.m.input_layer(x)
-        x = x + self._freq_emb
+        x = x + freq_emb
         x = self.m.input_norm_tar(x)
         return x, mean, std, nxt
 
@@ -229,6 +241,7 @@ class CachedUnivariateEngine:
         k: torch.Tensor,
         v: torch.Tensor,
         start: int,
+        rollout: RolloutSession,
     ) -> torch.Tensor:
         """Attention for newly appended tokens over ``[shared context | own tail]``.
 
@@ -245,22 +258,21 @@ class CachedUnivariateEngine:
         context part, so the context K/V are read once, not ``B`` times.
         """
         b, h, s, hd = q.shape
-        s0 = self._n_prefix
+        s0 = rollout.n_prefix
         lo = start - s0  # where these tokens land in the tail
         n_tail = lo + s
 
-        self._sk[li][:, :, lo:n_tail] = k
-        self._sv[li][:, :, lo:n_tail] = v
-        tk, tv = self._sk[li][:, :, :n_tail], self._sv[li][:, :, :n_tail]
-        pk, pv = self._pk[li][0], self._pv[li][0]  # (H, S0, hd)
+        rollout.sk[li][:, :, lo:n_tail] = k
+        rollout.sv[li][:, :, lo:n_tail] = v
+        tk, tv = rollout.sk[li][:, :, :n_tail], rollout.sv[li][:, :, :n_tail]
+        pk, pv = rollout.pk[li][0], rollout.pv[li][0]  # (H, S0, hd)
 
         scale = hd**-0.5
         qf = q.transpose(0, 1).reshape(h, b * s, hd)
         s_ctx = torch.matmul(qf, pk.transpose(-1, -2)) * scale  # (H, B*S, S0)
-        if not self._all_valid:
-            assert self._valid is not None
+        if not rollout.all_valid:
             # Empty patches are never keys.
-            s_ctx = s_ctx.masked_fill(~self._valid, float("-inf"))
+            s_ctx = s_ctx.masked_fill(~rollout.valid, float("-inf"))
 
         qi = torch.arange(start, start + s, device=q.device).unsqueeze(1)
         ki = s0 + torch.arange(n_tail, device=q.device).unsqueeze(0)
@@ -278,7 +290,9 @@ class CachedUnivariateEngine:
         )  # (B, H, S, hd)
         return out_ctx.reshape(h, b, s, hd).transpose(0, 1) + out_tail
 
-    def _decode(self, x: torch.Tensor, start: int) -> torch.Tensor:
+    def _decode(
+        self, x: torch.Tensor, start: int, rollout: RolloutSession
+    ) -> torch.Tensor:
         """Run the decoder stack over ``x`` ``(B, S, D)`` at absolute offset ``start``.
 
         ``start == 0`` encodes the shared context (batch 1) and keeps its K/V.
@@ -301,25 +315,24 @@ class CachedUnivariateEngine:
             k = self._apply_rope(k, start, s)
 
             if start == 0:
-                self._pk[li], self._pv[li] = k.contiguous(), v.contiguous()
-                if self._all_valid:
+                rollout.pk[li], rollout.pv[li] = k.contiguous(), v.contiguous()
+                if rollout.all_valid:
                     # Square and fully causal with every patch valid, so
                     # is_causal lets SDPA pick a flash kernel instead of
                     # materialising an (B, H, S, S) additive bias.
                     attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
                 else:
-                    assert self._valid is not None
                     keep = torch.ones(s, s, dtype=torch.bool, device=x.device).tril_()
-                    keep &= self._valid  # empty patches are never keys
+                    keep &= rollout.valid  # empty patches are never keys
                     attn = F.scaled_dot_product_attention(q, k, v, attn_mask=keep)
                     # ...and an empty patch's own row emits nothing (a row with
                     # no valid key at all comes out NaN; the model zeroes those
                     # too).
-                    attn = attn.nan_to_num(0.0) * self._valid.view(1, 1, s, 1).to(
+                    attn = attn.nan_to_num(0.0) * rollout.valid.view(1, 1, s, 1).to(
                         attn.dtype
                     )
             else:
-                attn = self._attend_shared_prefix(li, q, k, v, start)
+                attn = self._attend_shared_prefix(li, q, k, v, start, rollout)
 
             attn = attn.transpose(1, 2).contiguous().view(b, s, self.D)
             x = residual + sa.out(attn)
@@ -351,12 +364,13 @@ class CachedUnivariateEngine:
         scale: torch.Tensor,
         n_paths: int,
         max_patches: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, RolloutSession]:
         """Encode the shared context once at batch 1 and seed the KV cache.
 
-        Returns the context's final-patch forecast, ``(1, Q, output_len)``.
-        Every path sees the same context at step 0, so one result is shared —
-        the paths only diverge once they start sampling.
+        Returns the context's final-patch forecast, ``(1, Q, output_len)``,
+        and a session for passing to :meth:`extend`. Every path sees the same
+        context at step 0, so one result is shared — the paths only diverge
+        once they start sampling.
         """
         if patches.dim() != 3 or patches.shape[0] != 1:
             raise ValueError(
@@ -368,49 +382,61 @@ class CachedUnivariateEngine:
 
         # Patches holding no observed value at all (interior gaps). Left-padding
         # only blanks part of patch 0, so the common case has none of them.
-        self._valid = (mask.sum(-1) > 0)[0]  # (S,)
-        self._all_valid = bool(self._valid.all())
+        valid = (mask.sum(-1) > 0)[0]  # (S,)
+        all_valid = bool(valid.all())
 
         fe = self.m.freq_embedding(freq_id, scale=scale)
         if fe.dim() == 1:
             fe = fe.unsqueeze(0)
-        self._freq_emb = fe.unsqueeze(1)  # (1, 1, D)
+        freq_emb = fe.unsqueeze(1)  # (1, 1, D)
 
         nl = len(self.layers)
 
         # The context's K/V are stored once (batch 1, filled by the pass below);
         # only the patches generated during the rollout get a per-path cache.
         cache_dtype = self.m.input_layer.input_layer.weight.dtype
-        self._n_prefix = s
-        self._pk = [torch.empty(0)] * nl
-        self._pv = [torch.empty(0)] * nl
         tail_max = max(max_patches - s, 0)
-        self._sk = [
+        sk = [
             torch.empty(
-                n_paths, self.H, tail_max, self.hd, device=self.device, dtype=cache_dtype
+                n_paths,
+                self.H,
+                tail_max,
+                self.hd,
+                device=self.device,
+                dtype=cache_dtype,
             )
             for _ in range(nl)
         ]
-        self._sv = [torch.empty_like(t) for t in self._sk]
+        rollout = RolloutSession(
+            pk=[torch.empty(0) for _ in range(nl)],
+            pv=[torch.empty(0) for _ in range(nl)],
+            sk=sk,
+            sv=[torch.empty_like(t) for t in sk],
+            n_prefix=s,
+            valid=valid,
+            all_valid=all_valid,
+            pos=s,
+            freq_emb=freq_emb,
+        )
+        x, mean, std, state = self._embed(patches, mask, None, freq_emb)
+        x = self._decode(x, start=0, rollout=rollout)
 
-        x, mean, std, state = self._embed(patches, mask, None)
-        x = self._decode(x, start=0)
+        rollout.revin = state.expand(n_paths)
+        return self._head(x, mean, std), rollout
 
-        self._pos = s
-        self._state = state.expand(n_paths)
-        return self._head(x, mean, std)
-
-    def extend(self, patches: torch.Tensor) -> torch.Tensor:
+    def extend(self, rollout: RolloutSession, patches: torch.Tensor) -> torch.Tensor:
         """Append ``(B, S, patch_len)`` newly generated patches and forecast.
 
         Generated patches are always fully observed. Returns the new
         final-patch forecast, ``(B, Q, output_len)``.
         """
-        if self._state is None:
+        if rollout.revin is None:
             raise RuntimeError("call begin() before extend()")
         b, s, _ = patches.shape
         mask = torch.ones_like(patches, dtype=torch.bool)
-        x, mean, std, self._state = self._embed(patches, mask, self._state)
-        x = self._decode(x, start=self._pos)
-        self._pos += s
+        x, mean, std, rollout.revin = self._embed(
+            patches, mask, rollout.revin, rollout.freq_emb
+        )
+        x = self._decode(x, start=rollout.pos, rollout=rollout)
+        rollout.pos += s
         return self._head(x, mean, std)

@@ -491,7 +491,7 @@ class YugPipeline(BaseForecastPipeline):
 
         # Step 0: every path holds the identical context, so one forward pass
         # serves them all. The paths only diverge through their sampled u.
-        qf_device = eng.begin(
+        qf_device, rollout = eng.begin(
             ctx,
             ctx_mask,
             freq_ids,
@@ -517,7 +517,7 @@ class YugPipeline(BaseForecastPipeline):
                         block.reshape(n_paths, self._output_patches, self._patch_len)
                     )
                 ).to(self.device, dtype=torch.float32)
-                qf_device = eng.extend(new)
+                qf_device = eng.extend(rollout, new)
 
         return collected
 

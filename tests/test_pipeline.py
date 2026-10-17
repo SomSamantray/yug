@@ -7,11 +7,15 @@ Runs against a staged local checkpoint, so the whole file works offline.
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import pytest
 import torch
 
 from yug import QuantileForecast, YugConfig, YugPipeline
+from yug.engine import CachedUnivariateEngine
 from yug.pipeline import _unit_scale_affine
 
 
@@ -86,6 +90,41 @@ def test_same_seed_is_reproducible_and_different_seeds_are_not(pipeline, series)
     c = pipeline.predict(series, 32, num_samples=8, seed=43).values
     assert np.array_equal(a, b)
     assert not np.array_equal(a, c)
+
+
+def test_concurrent_cached_predictions_keep_rollout_state_separate(
+    pipeline, series, monkeypatch
+):
+    other = np.roll(series, 7) * 0.5 + 2.0
+    expected = [
+        pipeline.predict(series, 32, num_samples=3, seed=123).values,
+        pipeline.predict(other, 32, num_samples=7, seed=456).values,
+    ]
+
+    barrier = threading.Barrier(2)
+    begin_lock = threading.Lock()
+    original_begin = CachedUnivariateEngine.begin
+
+    def begin_then_overlap(self, *args, **kwargs):
+        with begin_lock:
+            result = original_begin(self, *args, **kwargs)
+        barrier.wait(timeout=30)
+        return result
+
+    monkeypatch.setattr(CachedUnivariateEngine, "begin", begin_then_overlap)
+
+    def predict(context, n_samples, seed):
+        return pipeline.predict(context, 32, num_samples=n_samples, seed=seed).values
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(predict, series, 3, 123),
+            pool.submit(predict, other, 7, 456),
+        ]
+        actual = [future.result(timeout=60) for future in futures]
+
+    for concurrent, serial in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(concurrent, serial)
 
 
 def test_cached_and_exact_engines_agree(pipeline, series):
