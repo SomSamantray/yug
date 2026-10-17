@@ -83,6 +83,13 @@ def test_patchify_marks_nans_invalid_and_zeroes_them():
     assert mask.tolist() == [[[True, False], [True, True]]]
 
 
+def test_patchify_marks_infinities_invalid_and_zeroes_them():
+    arr = np.array([[1.0, np.inf, -np.inf, 4.0]], dtype=np.float32)
+    values, mask = patchify(arr, 2)
+    assert values.tolist() == [[[1.0, 0.0], [0.0, 4.0]]]
+    assert mask.tolist() == [[[True, False], [False, True]]]
+
+
 def test_patchify_refuses_a_misaligned_series():
     with pytest.raises(ValueError, match="multiple of patch_len"):
         patchify(np.zeros((1, 20), dtype=np.float32), 16)

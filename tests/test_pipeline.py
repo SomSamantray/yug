@@ -59,6 +59,18 @@ def test_horizon_is_respected_exactly(pipeline, series, horizon):
     assert np.isfinite(forecast.values).all()
 
 
+def test_infinite_context_matches_nan_context(pipeline, series):
+    with_inf = series.copy()
+    with_nan = series.copy()
+    with_inf[10] = np.inf
+    with_nan[10] = np.nan
+
+    forecast_inf = pipeline.predict(with_inf, 16, num_samples=4, seed=7).values
+    forecast_nan = pipeline.predict(with_nan, 16, num_samples=4, seed=7).values
+
+    assert np.array_equal(forecast_inf, forecast_nan)
+
+
 @pytest.mark.parametrize(
     "make_context, expected",
     [

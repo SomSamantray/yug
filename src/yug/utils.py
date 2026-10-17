@@ -123,8 +123,9 @@ def pad_to_patch_multiple(
 def patchify(arr: np.ndarray, patch_len: int) -> tuple[np.ndarray, np.ndarray]:
     """``(N, T)`` float array -> ``(values, mask)`` shaped ``(N, T // patch_len, patch_len)``.
 
-    NaN becomes 0.0 in the values and ``False`` in the mask. ``T`` must already
-    be a multiple of ``patch_len`` (see :func:`pad_to_patch_multiple`).
+    Non-finite values become 0.0 in the values and ``False`` in the mask.
+    ``T`` must already be a multiple of ``patch_len`` (see
+    :func:`pad_to_patch_multiple`).
     """
     if arr.shape[-1] % patch_len:
         raise ValueError(
@@ -132,12 +133,12 @@ def patchify(arr: np.ndarray, patch_len: int) -> tuple[np.ndarray, np.ndarray]:
             f"call pad_to_patch_multiple first"
         )
     n_patches = arr.shape[-1] // patch_len
-    nan_mask = np.isnan(arr)
+    finite_mask = np.isfinite(arr)
     values = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
     n = arr.shape[0]
     return (
         np.ascontiguousarray(values.reshape(n, n_patches, patch_len)),
-        np.ascontiguousarray((~nan_mask).reshape(n, n_patches, patch_len)),
+        np.ascontiguousarray(finite_mask.reshape(n, n_patches, patch_len)),
     )
 
 

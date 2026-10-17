@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from yug import ForecastResult, InferenceConfig, YugForecaster
+from yug.forecaster import _MultivariateInferenceDataset, _UnivariateInferenceDataset
 
 
 @pytest.fixture
@@ -90,6 +91,28 @@ def test_a_zero_patch_series_fails_loudly_instead_of_returning_zeros():
     )
     with pytest.raises(ValueError, match="refusing to emit"):
         result.last_window_forecast(0)
+
+
+def test_univariate_inference_masks_infinities(tiny_config):
+    cfg = InferenceConfig.from_model_config(tiny_config, device="cpu")
+    dataset = _UnivariateInferenceDataset(
+        [{"target": np.array([1.0, np.inf, -np.inf, 4.0], dtype=np.float32)}], cfg
+    )
+
+    item = dataset[0]
+    assert item["patches"].ravel()[:4].tolist() == [1.0, 0.0, 0.0, 4.0]
+    assert item["mask"].ravel()[:4].tolist() == [1, 0, 0, 1]
+
+
+def test_multivariate_inference_masks_infinities(tiny_config):
+    cfg = InferenceConfig.from_model_config(tiny_config, device="cpu")
+    dataset = _MultivariateInferenceDataset(
+        [{"target": np.array([[1.0, np.inf, -np.inf, 4.0]], dtype=np.float32)}], cfg
+    )
+
+    item = dataset[0]
+    assert item["patches"].ravel()[:4].tolist() == [1.0, 0.0, 0.0, 4.0]
+    assert item["mask"].ravel()[:4].tolist() == [1, 0, 0, 1]
 
 
 def test_rejects_a_2d_series(forecaster, series):

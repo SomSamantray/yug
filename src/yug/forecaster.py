@@ -66,7 +66,7 @@ class _UnivariateInferenceDataset(Dataset):
         seq_len = len(series)
         fid = _freq_id(normalize_freq(r.get("freq", "D")))
 
-        nan_mask = np.isnan(series)
+        finite_mask = np.isfinite(series)
         series = np.nan_to_num(series, nan=0.0, posinf=0.0, neginf=0.0)
 
         rem = seq_len % self.cfg.patch_len
@@ -76,7 +76,7 @@ class _UnivariateInferenceDataset(Dataset):
 
         mask = np.zeros(len(series), dtype=np.int32)
         mask[:seq_len] = 1
-        mask[:seq_len] &= (~nan_mask).astype(np.int32)
+        mask[:seq_len] &= finite_mask.astype(np.int32)
 
         n_patches = len(series) // self.cfg.patch_len
         return {
@@ -114,7 +114,7 @@ class _MultivariateInferenceDataset(Dataset):
         padded_vars, masks = [], []
         for v in range(n_variables):
             vs = series[v]
-            nan_mask = np.isnan(vs)
+            finite_mask = np.isfinite(vs)
             vs = np.nan_to_num(vs, nan=0.0, posinf=0.0, neginf=0.0)
 
             rem = seq_len % self.cfg.patch_len
@@ -124,7 +124,7 @@ class _MultivariateInferenceDataset(Dataset):
 
             m = np.zeros(len(vs), dtype=np.int32)
             m[:seq_len] = 1
-            m[:seq_len] &= (~nan_mask).astype(np.int32)
+            m[:seq_len] &= finite_mask.astype(np.int32)
 
             n_patches = len(vs) // self.cfg.patch_len
             padded_vars.append(vs.reshape(n_patches, self.cfg.patch_len))
