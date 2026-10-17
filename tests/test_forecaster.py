@@ -79,6 +79,51 @@ def test_covariates_change_the_forecast(forecaster, series):
     assert not np.allclose(plain, with_cov)
 
 
+@pytest.mark.parametrize("target_index", [-1, 2])
+def test_negative_target_index_selects_requested_series(
+    forecaster, series, monkeypatch, target_index
+):
+    variates = np.stack([series + 1000, series + 2000])
+    captured = {}
+    original_forward = forecaster.model.forward
+
+    def capture_forward(input_target, input_variates=None, *args, **kwargs):
+        captured["target"] = input_target.detach().cpu().numpy()
+        return original_forward(input_target, input_variates, *args, **kwargs)
+
+    monkeypatch.setattr(forecaster.model, "forward", capture_forward)
+    forecaster.predict(series, variates=variates, target_index=target_index)
+
+    np.testing.assert_array_equal(captured["target"][0, 0], series[:8])
+
+
+@pytest.mark.parametrize("target_index", [-4, 3])
+def test_predict_rejects_out_of_range_target_index(forecaster, series, target_index):
+    variates = np.stack([series + 1000, series + 2000])
+
+    with pytest.raises(ValueError, match="target_index.*range"):
+        forecaster.predict(series, variates=variates, target_index=target_index)
+
+
+def test_multivariate_predict_batch_normalizes_negative_target_index(
+    forecaster, series, monkeypatch
+):
+    target = np.stack([series + 1000, series + 2000, series])
+    captured = {}
+    original_forward = forecaster.model.forward
+
+    def capture_forward(input_target, input_variates=None, *args, **kwargs):
+        captured["target"] = input_target.detach().cpu().numpy()
+        return original_forward(input_target, input_variates, *args, **kwargs)
+
+    monkeypatch.setattr(forecaster.model, "forward", capture_forward)
+    forecaster.predict_batch(
+        [{"target": target, "freq": "D"}], mode="multivariate", target_index=-1
+    )
+
+    np.testing.assert_array_equal(captured["target"][0, 0], series[:8])
+
+
 def test_a_zero_patch_series_fails_loudly_instead_of_returning_zeros():
     """The exact trap that used to produce silent all-zero forecasts."""
     result = ForecastResult(

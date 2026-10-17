@@ -163,6 +163,15 @@ def _collate_univariate_inference(batch: list[dict]) -> dict:
     }
 
 
+def _normalize_target_index(target_index: int, n_variables: int) -> int:
+    if not -n_variables <= target_index < n_variables:
+        raise ValueError(
+            f"target_index must be in range [-{n_variables}, {n_variables - 1}], "
+            f"got {target_index}"
+        )
+    return target_index % n_variables
+
+
 def _collate_multivariate_inference(batch: list[dict], target_index: int = 0) -> dict:
     max_p = max(b["n_patches"] for b in batch)
     patch_len = batch[0]["patches"].shape[-1]
@@ -336,6 +345,7 @@ class YugForecaster:
             variates = np.asarray(variates, dtype=np.float32)
             if variates.ndim == 1:
                 variates = variates.reshape(1, -1)
+            target_index = _normalize_target_index(target_index, variates.shape[0] + 1)
             combined = np.insert(variates, target_index, series, axis=0)
             return self._predict_records(
                 [{"target": combined, "freq": freq}],
@@ -357,6 +367,10 @@ class YugForecaster:
         num_input_patches_override: int | None = None,
     ) -> ForecastResult:
         """Forecast many records at once. Each is ``{"target": ..., "freq": ...}``."""
+        if mode == "multivariate" and records:
+            target = np.asarray(records[0]["target"])
+            n_variables = target.shape[0] if target.ndim > 1 else 1
+            target_index = _normalize_target_index(target_index, n_variables)
         return self._predict_records(
             records,
             mode=mode,
